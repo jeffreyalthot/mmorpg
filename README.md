@@ -5,6 +5,8 @@ J'ai fait évoluer le dépôt en **prototype MMORPG extensible** avec :
 - Un noyau RPG (progression, classes, factions, zones, combat, loot)
 - Un **serveur temps réel TCP** JSON prêt à connecter à un client 3D (Unity/Godot/Unreal)
 - Gestion multi-joueurs : connexion, déplacement 3D, proximité, chat local, combat
+- **Sharding automatique** (simulation massif): attribution des joueurs sur plusieurs shards
+- Téléportation inter-régions et état global du monde pour dashboard live
 
 > Objectif: fournir une base technique solide pour aller vers un "vrai" MMORPG à grande échelle.
 
@@ -22,6 +24,8 @@ J'ai fait évoluer le dépôt en **prototype MMORPG extensible** avec :
 - Action `nearby` pour récupérer les joueurs visibles à proximité
 - Action `say` + `chat_pull` pour le chat local de zone
 - Action `fight` pour déclencher un combat PvE côté serveur
+- Action `teleport` pour changer de région (si niveau suffisant)
+- Action `world_state` pour obtenir l'état massif du serveur (online, shards, top joueurs, régions)
 
 ## Lancer en mode solo CLI
 
@@ -53,6 +57,8 @@ Le protocole est **JSON line-based**:
 {"action":"say","name":"Alice","message":"Bonjour le monde"}
 {"action":"chat_pull","name":"Alice"}
 {"action":"fight","name":"Alice"}
+{"action":"teleport","name":"Alice","region":"Ruines d'Obsidienne"}
+{"action":"world_state"}
 ```
 
 Réponse serveur:

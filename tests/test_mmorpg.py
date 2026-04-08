@@ -97,3 +97,34 @@ def test_realtime_chat_delivery_and_pull():
     pulled = server.handle_request({"action": "chat_pull", "name": "Bob"})
     assert pulled["type"] == "chat"
     assert any("Salut Bob" in msg for msg in pulled["messages"])
+
+
+def test_world_state_and_shard_metadata():
+    server = MMORealtimeServer(seed=1, shard_count=2, shard_capacity=50)
+    server.handle_request(
+        {"action": "join", "name": "Alice", "faction": FACTIONS[0], "class": CLASSES[0]}
+    )
+    joined_bob = server.handle_request(
+        {"action": "join", "name": "Bob", "faction": FACTIONS[1], "class": CLASSES[1]}
+    )
+
+    assert "shard_id" in joined_bob["player"]
+    snapshot = server.handle_request({"action": "world_state"})
+    assert snapshot["type"] == "world_state"
+    assert snapshot["online"] == 2
+    assert len(snapshot["shards"]) == 2
+
+
+def test_teleport_requires_unlocked_region():
+    server = MMORealtimeServer(seed=9)
+    server.handle_request(
+        {"action": "join", "name": "Alice", "faction": FACTIONS[0], "class": CLASSES[0]}
+    )
+
+    try:
+        server.handle_request(
+            {"action": "teleport", "name": "Alice", "region": "Faille Céleste"}
+        )
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass

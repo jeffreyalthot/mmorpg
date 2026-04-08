@@ -5,7 +5,7 @@ import socketserver
 import threading
 from dataclasses import dataclass, field
 from random import Random
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 
 FACTIONS = ["Aube de Fer", "Conclave Astral", "Horde Émeraude"]
@@ -90,6 +90,8 @@ class ConnectedPlayerState:
     position: Vec3 = field(default_factory=lambda: Vec3(0.0, 0.0, 0.0))
     velocity: Vec3 = field(default_factory=lambda: Vec3(0.0, 0.0, 0.0))
     nearby_chat: List[str] = field(default_factory=list)
+    shard_id: int = 0
+    region_name: str = "Plaine des Novices"
 
 
 class World:
@@ -196,13 +198,22 @@ class MMORealtimeServer:
       - Le client doit d'abord faire `join`.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 7777, seed: int | None = None):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 7777,
+        seed: int | None = None,
+        shard_count: int = 1,
+        shard_capacity: int = 200,
+    ):
         self.host = host
         self.port = port
         self.world = World(seed=seed)
         self._rng = Random(seed)
         self._lock = threading.RLock()
         self.players: Dict[str, ConnectedPlayerState] = {}
+        self.shard_count = max(1, shard_count)
+        self.shard_capacity = max(10, shard_capacity)
 
     def _serialize_player(self, state: ConnectedPlayerState) -> Dict[str, object]:
         p = state.player
@@ -216,18 +227,40 @@ class MMORealtimeServer:
             "attack": p.attack,
             "gold": p.gold,
             "position": {"x": state.position.x, "y": state.position.y, "z": state.position.z},
+            "shard_id": state.shard_id,
+            "region": state.region_name,
         }
+
+    def _assign_shard(self) -> int:
+        populations: Dict[int, int] = {idx: 0 for idx in range(self.shard_count)}
+        for state in self.players.values():
+            populations[state.shard_id] = populations.get(state.shard_id, 0) + 1
+        shard_id, size = min(populations.items(), key=lambda item: item[1])
+        if size >= self.shard_capacity:
+            raise ValueError("Serveur saturé: tous les shards sont pleins")
+        return shard_id
+
+    def _best_region_for_level(self, level: int) -> Region:
+        unlocked = [region for region in self.world.regions if level >= region.min_level]
+        return unlocked[-1]
 
     def join(self, *, name: str, faction: str, klass: str) -> Dict[str, object]:
         with self._lock:
             if name in self.players:
                 raise ValueError("Pseudo déjà utilisé")
             player = self.world.create_player(name=name, faction=faction, klass=klass)
-            self.players[name] = ConnectedPlayerState(player=player)
+            shard_id = self._assign_shard()
+            region = self._best_region_for_level(player.level)
+            self.players[name] = ConnectedPlayerState(
+                player=player,
+                shard_id=shard_id,
+                region_name=region.name,
+            )
             return {
                 "type": "joined",
                 "player": self._serialize_player(self.players[name]),
                 "online": len(self.players),
+                "shard_population": self._shard_population(shard_id),
             }
 
     def move(self, *, name: str, dx: float, dy: float, dz: float) -> Dict[str, object]:
@@ -255,6 +288,8 @@ class MMORealtimeServer:
             for other_name, other in self.players.items():
                 if other_name == name:
                     continue
+                if other.shard_id != state.shard_id:
+                    continue
                 dist = _distance(state.position, other.position)
                 if dist <= radius:
                     result.append(
@@ -267,10 +302,11 @@ class MMORealtimeServer:
                                 "z": round(other.position.z, 2),
                             },
                             "level": other.player.level,
+                            "region": other.region_name,
                         }
                     )
             result.sort(key=lambda x: x["distance"])
-            return {"type": "nearby", "players": result}
+            return {"type": "nearby", "players": result, "shard_id": state.shard_id}
 
     def say(self, *, name: str, message: str, radius: float = 180.0) -> Dict[str, object]:
         with self._lock:
@@ -280,6 +316,8 @@ class MMORealtimeServer:
             if not trimmed:
                 raise ValueError("Message vide")
             for other_name, other in self.players.items():
+                if other.shard_id != speaker.shard_id:
+                    continue
                 if _distance(speaker.position, other.position) <= radius:
                     other.nearby_chat.append(f"[{name}] {trimmed}")
                     recipients += 1
@@ -287,6 +325,7 @@ class MMORealtimeServer:
                 "type": "say",
                 "from": name,
                 "delivered": recipients,
+                "shard_id": speaker.shard_id,
             }
 
     def chat_pull(self, *, name: str) -> Dict[str, object]:
@@ -298,14 +337,61 @@ class MMORealtimeServer:
     def fight(self, *, name: str) -> Dict[str, object]:
         with self._lock:
             state = self.players[name]
-            region = self.world.available_regions(state.player)[-1]
+            region = self._best_region_for_level(state.player.level)
+            state.region_name = region.name
             enemy = self.world.rng.choice(region.enemies)
             log = self.world.run_combat(state.player, enemy)
             return {
                 "type": "combat",
                 "enemy": enemy.name,
+                "region": region.name,
                 "log": log,
                 "player": self._serialize_player(state),
+            }
+
+    def teleport_region(self, *, name: str, region_name: str) -> Dict[str, object]:
+        with self._lock:
+            state = self.players[name]
+            candidates = {region.name: region for region in self.world.regions}
+            if region_name not in candidates:
+                raise ValueError("Région inconnue")
+            region = candidates[region_name]
+            if state.player.level < region.min_level:
+                raise ValueError("Niveau insuffisant pour cette région")
+            state.region_name = region_name
+            # on repositionne le joueur pour éviter les collisions de spawn
+            offset = self._rng.uniform(-30, 30)
+            state.position = Vec3(offset, 0.0, offset)
+            return {
+                "type": "teleport",
+                "region": region_name,
+                "position": {"x": round(state.position.x, 2), "y": 0.0, "z": round(state.position.z, 2)},
+                "shard_id": state.shard_id,
+            }
+
+    def _shard_population(self, shard_id: int) -> int:
+        return sum(1 for state in self.players.values() if state.shard_id == shard_id)
+
+    def world_state(self) -> Dict[str, object]:
+        with self._lock:
+            top_players: List[Tuple[str, int]] = sorted(
+                ((name, state.player.level) for name, state in self.players.items()),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:10]
+            shards = [
+                {"shard_id": shard_id, "population": self._shard_population(shard_id)}
+                for shard_id in range(self.shard_count)
+            ]
+            return {
+                "type": "world_state",
+                "online": len(self.players),
+                "shards": shards,
+                "top_players": [{"name": name, "level": level} for name, level in top_players],
+                "regions": [
+                    {"name": region.name, "min_level": region.min_level, "enemy_count": len(region.enemies)}
+                    for region in self.world.regions
+                ],
             }
 
     def handle_request(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -319,6 +405,8 @@ class MMORealtimeServer:
                 faction=str(payload["faction"]),
                 klass=str(payload["class"]),
             )
+        if action == "world_state":
+            return self.world_state()
 
         name = str(payload.get("name", ""))
         if not name:
@@ -341,6 +429,8 @@ class MMORealtimeServer:
             return self.chat_pull(name=name)
         if action == "fight":
             return self.fight(name=name)
+        if action == "teleport":
+            return self.teleport_region(name=name, region_name=str(payload.get("region", "")))
 
         raise ValueError(f"Action inconnue: {action}")
 
