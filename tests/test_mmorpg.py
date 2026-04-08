@@ -128,3 +128,46 @@ def test_teleport_requires_unlocked_region():
         assert False, "Expected ValueError"
     except ValueError:
         pass
+
+
+def test_explore_gather_and_craft_flow():
+    server = MMORealtimeServer(seed=4)
+    server.handle_request(
+        {"action": "join", "name": "Alice", "faction": FACTIONS[0], "class": CLASSES[0]}
+    )
+
+    explored = server.handle_request({"action": "explore", "name": "Alice"})
+    assert explored["type"] == "explore"
+    assert "biome" in explored["chunk"]
+
+    # injecte directement les ressources pour valider le craft de manière déterministe
+    state = server.players["Alice"]
+    state.resources["Fragment antique"] = 2
+    state.resources["Noyau d'obsidienne"] = 1
+    before_attack = state.player.attack
+    crafted = server.handle_request(
+        {"action": "craft", "name": "Alice", "recipe": "Lame astrale"}
+    )
+    assert crafted["type"] == "crafted"
+    assert crafted["player"]["attack"] > before_attack
+
+
+def test_guild_and_raid():
+    server = MMORealtimeServer(seed=11)
+    for idx, fname in enumerate(("Alice", "Bob", "Cleo")):
+        server.handle_request(
+            {"action": "join", "name": fname, "faction": FACTIONS[idx], "class": CLASSES[idx]}
+        )
+
+    created = server.handle_request(
+        {"action": "guild_create", "name": "Alice", "guild": "Les Immortels"}
+    )
+    assert created["type"] == "guild_created"
+    joined = server.handle_request(
+        {"action": "guild_join", "name": "Bob", "guild": "Les Immortels"}
+    )
+    assert joined["type"] == "guild_joined"
+
+    raid = server.handle_request({"action": "raid", "name": "Alice"})
+    assert raid["type"] == "raid"
+    assert len(raid["participants"]) == 3
