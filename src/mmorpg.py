@@ -92,6 +92,8 @@ class ConnectedPlayerState:
     nearby_chat: List[str] = field(default_factory=list)
     shard_id: int = 0
     region_name: str = "Plaine des Novices"
+    guild: str | None = None
+    resources: Dict[str, int] = field(default_factory=dict)
 
 
 class World:
@@ -99,6 +101,7 @@ class World:
 
     def __init__(self, seed: int | None = None):
         self.rng = Random(seed)
+        self.generated_chunks: Dict[Tuple[int, int], Dict[str, object]] = {}
         self.regions = [
             Region(
                 "Plaine des Novices",
@@ -125,6 +128,26 @@ class World:
                 ],
             ),
         ]
+        self.biomes = ["forêt", "désert", "toundra", "marais", "ruines"]
+        self.resource_table = {
+            "forêt": ["Bois ancien", "Sève arcanique"],
+            "désert": ["Cristal solaire", "Sable runique"],
+            "toundra": ["Givre vivant", "Minerai polaire"],
+            "marais": ["Champignon abyssal", "Fibres de liane"],
+            "ruines": ["Fragment antique", "Noyau d'obsidienne"],
+        }
+        self.recipes = {
+            "Lame astrale": {
+                "requires": {"Fragment antique": 2, "Noyau d'obsidienne": 1},
+                "bonus_attack": 6,
+                "bonus_hp": 0,
+            },
+            "Armure des titans": {
+                "requires": {"Minerai polaire": 2, "Bois ancien": 2},
+                "bonus_attack": 0,
+                "bonus_hp": 35,
+            },
+        }
 
     def create_player(self, name: str, faction: str, klass: str) -> Player:
         if faction not in FACTIONS:
@@ -188,6 +211,26 @@ class World:
 
         return log
 
+    def chunk_key(self, pos: Vec3) -> Tuple[int, int]:
+        return int(pos.x // 250), int(pos.z // 250)
+
+    def generate_chunk(self, key: Tuple[int, int]) -> Dict[str, object]:
+        if key in self.generated_chunks:
+            return self.generated_chunks[key]
+        biome = self.rng.choice(self.biomes)
+        level_bias = self.rng.randint(1, 10)
+        info = {
+            "chunk": {"cx": key[0], "cz": key[1]},
+            "biome": biome,
+            "danger_level": level_bias,
+            "resources": self.resource_table[biome],
+            "landmark": self.rng.choice(
+                ["tour effondrée", "autel oublié", "fortin détruit", "arbre-monde brisé"]
+            ),
+        }
+        self.generated_chunks[key] = info
+        return info
+
 
 class MMORealtimeServer:
     """Serveur TCP JSON line-based, prêt pour un client 3D (Unity/Godot/Unreal).
@@ -212,6 +255,7 @@ class MMORealtimeServer:
         self._rng = Random(seed)
         self._lock = threading.RLock()
         self.players: Dict[str, ConnectedPlayerState] = {}
+        self.guilds: Dict[str, List[str]] = {}
         self.shard_count = max(1, shard_count)
         self.shard_capacity = max(10, shard_capacity)
 
@@ -229,6 +273,8 @@ class MMORealtimeServer:
             "position": {"x": state.position.x, "y": state.position.y, "z": state.position.z},
             "shard_id": state.shard_id,
             "region": state.region_name,
+            "guild": state.guild,
+            "resources": dict(state.resources),
         }
 
     def _assign_shard(self) -> int:
@@ -349,6 +395,115 @@ class MMORealtimeServer:
                 "player": self._serialize_player(state),
             }
 
+    def explore(self, *, name: str) -> Dict[str, object]:
+        with self._lock:
+            state = self.players[name]
+            key = self.world.chunk_key(state.position)
+            chunk = self.world.generate_chunk(key)
+            return {
+                "type": "explore",
+                "name": name,
+                "chunk": chunk,
+            }
+
+    def gather(self, *, name: str) -> Dict[str, object]:
+        with self._lock:
+            state = self.players[name]
+            chunk = self.world.generate_chunk(self.world.chunk_key(state.position))
+            resource = self._rng.choice(chunk["resources"])
+            amount = self._rng.randint(1, 3)
+            state.resources[resource] = state.resources.get(resource, 0) + amount
+            return {
+                "type": "gather",
+                "resource": resource,
+                "amount": amount,
+                "inventory": dict(state.resources),
+            }
+
+    def craft(self, *, name: str, recipe_name: str) -> Dict[str, object]:
+        with self._lock:
+            state = self.players[name]
+            if recipe_name not in self.world.recipes:
+                raise ValueError("Recette inconnue")
+            recipe = self.world.recipes[recipe_name]
+            for resource, needed in recipe["requires"].items():
+                if state.resources.get(resource, 0) < needed:
+                    raise ValueError(f"Ressources insuffisantes pour {resource}")
+            for resource, needed in recipe["requires"].items():
+                state.resources[resource] -= needed
+            state.player.attack += recipe["bonus_attack"]
+            state.player.max_hp += recipe["bonus_hp"]
+            state.player.hp = min(state.player.max_hp, state.player.hp + recipe["bonus_hp"])
+            return {
+                "type": "crafted",
+                "item": recipe_name,
+                "player": self._serialize_player(state),
+            }
+
+    def create_guild(self, *, name: str, guild_name: str) -> Dict[str, object]:
+        with self._lock:
+            guild_name = guild_name.strip()[:32]
+            if not guild_name:
+                raise ValueError("Nom de guilde vide")
+            if guild_name in self.guilds:
+                raise ValueError("Guilde déjà existante")
+            state = self.players[name]
+            if state.guild:
+                raise ValueError("Le joueur est déjà dans une guilde")
+            self.guilds[guild_name] = [name]
+            state.guild = guild_name
+            return {"type": "guild_created", "guild": guild_name, "members": [name]}
+
+    def join_guild(self, *, name: str, guild_name: str) -> Dict[str, object]:
+        with self._lock:
+            if guild_name not in self.guilds:
+                raise ValueError("Guilde introuvable")
+            state = self.players[name]
+            if state.guild:
+                raise ValueError("Le joueur est déjà dans une guilde")
+            self.guilds[guild_name].append(name)
+            state.guild = guild_name
+            return {
+                "type": "guild_joined",
+                "guild": guild_name,
+                "members": list(self.guilds[guild_name]),
+            }
+
+    def raid_boss(self, *, name: str) -> Dict[str, object]:
+        with self._lock:
+            leader = self.players[name]
+            party = [
+                other for other in self.players.values()
+                if other.shard_id == leader.shard_id and other.region_name == leader.region_name
+            ]
+            if len(party) < 3:
+                raise ValueError("Il faut au moins 3 joueurs dans la même région pour un raid")
+            boss_hp = 500 + len(party) * 80
+            combined_attack = sum(member.player.attack for member in party)
+            turns = 0
+            while boss_hp > 0 and turns < 8:
+                turns += 1
+                boss_hp -= max(1, combined_attack + self._rng.randint(-10, 20))
+                for member in party:
+                    member.player.hp = max(1, member.player.hp - self._rng.randint(2, 12))
+            victory = boss_hp <= 0
+            rewards = []
+            if victory:
+                for member in party:
+                    xp_gain = 120 + self._rng.randint(0, 50)
+                    member.player.gold += 75
+                    member.player.inventory["Potion"] = member.player.inventory.get("Potion", 0) + 1
+                    member.player.add_xp(xp_gain)
+                    rewards.append({"name": member.player.name, "xp": xp_gain, "gold": 75})
+            return {
+                "type": "raid",
+                "boss": "Titan du Néant",
+                "victory": victory,
+                "turns": turns,
+                "participants": [member.player.name for member in party],
+                "rewards": rewards,
+            }
+
     def teleport_region(self, *, name: str, region_name: str) -> Dict[str, object]:
         with self._lock:
             state = self.players[name]
@@ -392,6 +547,7 @@ class MMORealtimeServer:
                     {"name": region.name, "min_level": region.min_level, "enemy_count": len(region.enemies)}
                     for region in self.world.regions
                 ],
+                "guilds": [{"name": gname, "members": len(members)} for gname, members in self.guilds.items()],
             }
 
     def handle_request(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -429,6 +585,18 @@ class MMORealtimeServer:
             return self.chat_pull(name=name)
         if action == "fight":
             return self.fight(name=name)
+        if action == "explore":
+            return self.explore(name=name)
+        if action == "gather":
+            return self.gather(name=name)
+        if action == "craft":
+            return self.craft(name=name, recipe_name=str(payload.get("recipe", "")))
+        if action == "guild_create":
+            return self.create_guild(name=name, guild_name=str(payload.get("guild", "")))
+        if action == "guild_join":
+            return self.join_guild(name=name, guild_name=str(payload.get("guild", "")))
+        if action == "raid":
+            return self.raid_boss(name=name)
         if action == "teleport":
             return self.teleport_region(name=name, region_name=str(payload.get("region", "")))
 

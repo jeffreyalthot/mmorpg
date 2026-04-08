@@ -7,6 +7,9 @@ J'ai fait évoluer le dépôt en **prototype MMORPG extensible** avec :
 - Gestion multi-joueurs : connexion, déplacement 3D, proximité, chat local, combat
 - **Sharding automatique** (simulation massif): attribution des joueurs sur plusieurs shards
 - Téléportation inter-régions et état global du monde pour dashboard live
+- Exploration procédurale par chunks (biomes, landmarks, niveau de danger)
+- Récolte de ressources + crafting d'équipements
+- Système de guildes + raids coopératifs (3+ joueurs)
 
 > Objectif: fournir une base technique solide pour aller vers un "vrai" MMORPG à grande échelle.
 
@@ -24,6 +27,11 @@ J'ai fait évoluer le dépôt en **prototype MMORPG extensible** avec :
 - Action `nearby` pour récupérer les joueurs visibles à proximité
 - Action `say` + `chat_pull` pour le chat local de zone
 - Action `fight` pour déclencher un combat PvE côté serveur
+- Action `explore` pour découvrir le chunk courant et son biome
+- Action `gather` pour récolter des ressources rares
+- Action `craft` pour fabriquer de l'équipement évolutif
+- Action `guild_create` / `guild_join` pour former une guilde
+- Action `raid` pour lancer un boss coopératif massivement multijoueur
 - Action `teleport` pour changer de région (si niveau suffisant)
 - Action `world_state` pour obtenir l'état massif du serveur (online, shards, top joueurs, régions)
 
@@ -57,6 +65,12 @@ Le protocole est **JSON line-based**:
 {"action":"say","name":"Alice","message":"Bonjour le monde"}
 {"action":"chat_pull","name":"Alice"}
 {"action":"fight","name":"Alice"}
+{"action":"explore","name":"Alice"}
+{"action":"gather","name":"Alice"}
+{"action":"craft","name":"Alice","recipe":"Lame astrale"}
+{"action":"guild_create","name":"Alice","guild":"Les Immortels"}
+{"action":"guild_join","name":"Bob","guild":"Les Immortels"}
+{"action":"raid","name":"Alice"}
 {"action":"teleport","name":"Alice","region":"Ruines d'Obsidienne"}
 {"action":"world_state"}
 ```
