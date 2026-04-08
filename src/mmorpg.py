@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import socketserver
+import threading
 from dataclasses import dataclass, field
 from random import Random
 from typing import Dict, List
@@ -23,6 +26,20 @@ class Region:
     name: str
     min_level: int
     enemies: List[Enemy]
+
+
+@dataclass
+class Vec3:
+    x: float
+    y: float
+    z: float
+
+    def clamp(self, min_value: float, max_value: float) -> "Vec3":
+        return Vec3(
+            x=max(min_value, min(max_value, self.x)),
+            y=max(min_value, min(max_value, self.y)),
+            z=max(min_value, min(max_value, self.z)),
+        )
 
 
 @dataclass
@@ -67,8 +84,16 @@ class Player:
         return self.heal(40)
 
 
+@dataclass
+class ConnectedPlayerState:
+    player: Player
+    position: Vec3 = field(default_factory=lambda: Vec3(0.0, 0.0, 0.0))
+    velocity: Vec3 = field(default_factory=lambda: Vec3(0.0, 0.0, 0.0))
+    nearby_chat: List[str] = field(default_factory=list)
+
+
 class World:
-    """Mini noyau MMORPG solo: progression, zones, combat et économie."""
+    """Noyau MMORPG: progression, zones, combat et économie."""
 
     def __init__(self, seed: int | None = None):
         self.rng = Random(seed)
@@ -162,6 +187,192 @@ class World:
         return log
 
 
+class MMORealtimeServer:
+    """Serveur TCP JSON line-based, prêt pour un client 3D (Unity/Godot/Unreal).
+
+    Protocole:
+      - Chaque requête est une ligne JSON UTF-8.
+      - Réponse = événement(s) JSON avec champ `type`.
+      - Le client doit d'abord faire `join`.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 7777, seed: int | None = None):
+        self.host = host
+        self.port = port
+        self.world = World(seed=seed)
+        self._rng = Random(seed)
+        self._lock = threading.RLock()
+        self.players: Dict[str, ConnectedPlayerState] = {}
+
+    def _serialize_player(self, state: ConnectedPlayerState) -> Dict[str, object]:
+        p = state.player
+        return {
+            "name": p.name,
+            "faction": p.faction,
+            "class": p.klass,
+            "level": p.level,
+            "hp": p.hp,
+            "max_hp": p.max_hp,
+            "attack": p.attack,
+            "gold": p.gold,
+            "position": {"x": state.position.x, "y": state.position.y, "z": state.position.z},
+        }
+
+    def join(self, *, name: str, faction: str, klass: str) -> Dict[str, object]:
+        with self._lock:
+            if name in self.players:
+                raise ValueError("Pseudo déjà utilisé")
+            player = self.world.create_player(name=name, faction=faction, klass=klass)
+            self.players[name] = ConnectedPlayerState(player=player)
+            return {
+                "type": "joined",
+                "player": self._serialize_player(self.players[name]),
+                "online": len(self.players),
+            }
+
+    def move(self, *, name: str, dx: float, dy: float, dz: float) -> Dict[str, object]:
+        with self._lock:
+            state = self.players[name]
+            state.position = Vec3(
+                state.position.x + dx,
+                state.position.y + dy,
+                state.position.z + dz,
+            ).clamp(-5000.0, 5000.0)
+            return {
+                "type": "moved",
+                "name": name,
+                "position": {
+                    "x": round(state.position.x, 2),
+                    "y": round(state.position.y, 2),
+                    "z": round(state.position.z, 2),
+                },
+            }
+
+    def nearby(self, *, name: str, radius: float = 120.0) -> Dict[str, object]:
+        with self._lock:
+            state = self.players[name]
+            result: List[Dict[str, object]] = []
+            for other_name, other in self.players.items():
+                if other_name == name:
+                    continue
+                dist = _distance(state.position, other.position)
+                if dist <= radius:
+                    result.append(
+                        {
+                            "name": other_name,
+                            "distance": round(dist, 2),
+                            "position": {
+                                "x": round(other.position.x, 2),
+                                "y": round(other.position.y, 2),
+                                "z": round(other.position.z, 2),
+                            },
+                            "level": other.player.level,
+                        }
+                    )
+            result.sort(key=lambda x: x["distance"])
+            return {"type": "nearby", "players": result}
+
+    def say(self, *, name: str, message: str, radius: float = 180.0) -> Dict[str, object]:
+        with self._lock:
+            speaker = self.players[name]
+            recipients = 0
+            trimmed = message.strip()[:200]
+            if not trimmed:
+                raise ValueError("Message vide")
+            for other_name, other in self.players.items():
+                if _distance(speaker.position, other.position) <= radius:
+                    other.nearby_chat.append(f"[{name}] {trimmed}")
+                    recipients += 1
+            return {
+                "type": "say",
+                "from": name,
+                "delivered": recipients,
+            }
+
+    def chat_pull(self, *, name: str) -> Dict[str, object]:
+        with self._lock:
+            inbox = self.players[name].nearby_chat[:]
+            self.players[name].nearby_chat.clear()
+            return {"type": "chat", "messages": inbox}
+
+    def fight(self, *, name: str) -> Dict[str, object]:
+        with self._lock:
+            state = self.players[name]
+            region = self.world.available_regions(state.player)[-1]
+            enemy = self.world.rng.choice(region.enemies)
+            log = self.world.run_combat(state.player, enemy)
+            return {
+                "type": "combat",
+                "enemy": enemy.name,
+                "log": log,
+                "player": self._serialize_player(state),
+            }
+
+    def handle_request(self, payload: Dict[str, object]) -> Dict[str, object]:
+        action = payload.get("action")
+        if not isinstance(action, str):
+            raise ValueError("Champ 'action' manquant")
+
+        if action == "join":
+            return self.join(
+                name=str(payload["name"]),
+                faction=str(payload["faction"]),
+                klass=str(payload["class"]),
+            )
+
+        name = str(payload.get("name", ""))
+        if not name:
+            raise ValueError("Champ 'name' requis")
+        if name not in self.players:
+            raise ValueError("Joueur inconnu")
+
+        if action == "move":
+            return self.move(
+                name=name,
+                dx=float(payload.get("dx", 0.0)),
+                dy=float(payload.get("dy", 0.0)),
+                dz=float(payload.get("dz", 0.0)),
+            )
+        if action == "nearby":
+            return self.nearby(name=name, radius=float(payload.get("radius", 120.0)))
+        if action == "say":
+            return self.say(name=name, message=str(payload.get("message", "")))
+        if action == "chat_pull":
+            return self.chat_pull(name=name)
+        if action == "fight":
+            return self.fight(name=name)
+
+        raise ValueError(f"Action inconnue: {action}")
+
+    def create_tcp_handler(self):
+        server = self
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self):
+                while True:
+                    raw = self.rfile.readline()
+                    if not raw:
+                        return
+                    try:
+                        payload = json.loads(raw.decode("utf-8"))
+                        response = server.handle_request(payload)
+                        envelope = {"ok": True, "event": response}
+                    except Exception as exc:  # Protocole: toujours encapsuler l'erreur
+                        envelope = {"ok": False, "error": str(exc)}
+                    self.wfile.write((json.dumps(envelope) + "\n").encode("utf-8"))
+
+        return Handler
+
+    def serve_forever(self):
+        with socketserver.ThreadingTCPServer((self.host, self.port), self.create_tcp_handler()) as srv:
+            print(f"MMO server ready on {self.host}:{self.port}")
+            srv.serve_forever()
+
+
+def _distance(a: Vec3, b: Vec3) -> float:
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
+
+
 def short_status(player: Player) -> str:
     return (
         f"{player.name} | {player.klass} {player.level} | HP {player.hp}/{player.max_hp} | "
@@ -220,5 +431,16 @@ def run_cli() -> None:
         print("Commande inconnue.")
 
 
+def run_server_cli() -> None:
+    host = input("Host [127.0.0.1]: ").strip() or "127.0.0.1"
+    port_raw = input("Port [7777]: ").strip() or "7777"
+    port = int(port_raw)
+    MMORealtimeServer(host=host, port=port).serve_forever()
+
+
 if __name__ == "__main__":
-    run_cli()
+    mode = input("Mode [solo/server]: ").strip().lower() or "solo"
+    if mode == "server":
+        run_server_cli()
+    else:
+        run_cli()
